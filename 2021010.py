@@ -748,34 +748,210 @@ class VAE_TRAINED:
         ssim_score = ssim(original_for_ssim.cpu().numpy(),output[0].detach().cpu().numpy(), data_range=output[0].detach().cpu().numpy().max()-output[0].detach().cpu().numpy().min(),win_size=11,channel_axis=0)
         return ssim_score
 
-class CVAELossFn():
-    """
-    Write code for loss function for training Conditional Variational AutoEncoder
-    """
-    pass
+class CVAE(nn.Module):
+    def __init__(self, input_dim=784, hidden_dim=400, latent_dim=20, num_classes=10):
+        super(CVAE, self).__init__()
+        self.num_classes = num_classes
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
 
+        # Encoder layers
+        self.fc1 = nn.Linear(input_dim + num_classes, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder layers
+        self.fc3 = nn.Linear(latent_dim + num_classes, hidden_dim)
+        self.fc4 = nn.Linear(hidden_dim, input_dim)
+
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+    def encode(self, x, c):
+        # Concatenate input with condition
+        x = torch.cat([x, c], dim=1)
+        h1 = self.relu(self.fc1(x))
+        mu = self.fc_mu(h1)
+        logvar = self.fc_logvar(h1)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, c):
+        # Concatenate latent vector with condition
+        z = torch.cat([z, c], dim=1)
+        h3 = self.relu(self.fc3(z))
+        return self.sigmoid(self.fc4(h3))
+
+    def forward(self, x, c):
+        mu, logvar = self.encode(x, c)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z, c)
+        return recon_x, mu, logvar, z
+
+# Loss Function for CVAE
+class CVAELossFn(nn.Module):
+    """
+    Loss function for Conditional Variational AutoEncoder.
+    Combines reconstruction loss and KL divergence.
+    """
+    def __init__(self, reconstruction_loss_fn=nn.BCELoss(reduction='sum')):
+        super(CVAELossFn, self).__init__()
+        self.reconstruction_loss_fn = reconstruction_loss_fn
+
+    def forward(self, recon_x, x, mu, logvar):
+        # Reconstruction loss
+        BCE = self.reconstruction_loss_fn(recon_x, x)
+        # KL Divergence
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return BCE + KLD
+
+# Trainer Class for CVAE
 class CVAE_Trainer:
     """
-    Write code for training Conditional Variational AutoEncoder here.
+    Trainer for Conditional Variational AutoEncoder.
     
-    for each 10th minibatch use only this print statement
-    print(">>>>> Epoch:{}, Minibatch:{}, Loss:{}, Similarity:{}".format(epoch,minibatch,loss,similarity))
-    
-    for each epoch use only this print statement
-    print("----- Epoch:{}, Loss:{}, Similarity:{}")
-    
-    After every 5 epochs make 3D TSNE plot of logits of whole data and save the image as CVAE_epoch_{}.png
+    - Prints specific statements for each 10th minibatch and each epoch.
+    - Generates and saves 3D t-SNE plots of the latent space every 5 epochs.
     """
-    pass
+    def __init__(self, model, dataloader, optimizer, loss_fn, device='cpu', num_epochs=50):
+        self.model = model.to(device)
+        self.dataloader = dataloader
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.device = device
+        self.num_epochs = num_epochs
 
+    def train(self):
+        self.model.train()
+        for epoch in range(1, self.num_epochs + 1):
+            epoch_loss = 0
+            all_latents = []
+            all_labels = []
+            for minibatch, (data, labels) in enumerate(self.dataloader, 1):
+                data = data.view(data.size(0), -1).to(self.device)
+                # One-hot encode labels
+                labels_onehot = torch.zeros(data.size(0), self.model.num_classes).to(self.device)
+                labels_onehot.scatter_(1, labels.view(-1,1).to(self.device), 1)
+                
+                self.optimizer.zero_grad()
+                recon_batch, mu, logvar, z = self.model(data, labels_onehot)
+                loss = self.loss_fn(recon_batch, data, mu, logvar)
+                loss.backward()
+                self.optimizer.step()
+
+                epoch_loss += loss.item()
+
+                # Collect latents and labels for t-SNE
+                all_latents.append(z.detach().cpu())
+                all_labels.append(labels.detach().cpu())
+
+                # Every 10th minibatch
+                if minibatch % 10 == 0:
+                    # Compute similarity (e.g., cosine similarity between mu and z)
+                    similarity = torch.cosine_similarity(mu, z).mean().item()
+                    print(">>>>> Epoch:{}, Minibatch:{}, Loss:{:.4f}, Similarity:{:.4f}".format(
+                        epoch, minibatch, loss.item(), similarity))
+
+            avg_epoch_loss = epoch_loss / len(self.dataloader.dataset)
+            # Compute overall similarity for the epoch
+            all_latents_tensor = torch.cat(all_latents, dim=0)
+            all_labels_tensor = torch.cat(all_labels, dim=0)
+            # Example similarity metric: average pairwise cosine similarity
+            # Here, we use similarity between mu and z as a proxy
+            # Adjust as needed
+            with torch.no_grad():
+                _, mu, _, _ = self.model(self.dataloader.dataset.data.view(-1, 784).to(self.device),
+                                        torch.zeros(len(self.dataloader.dataset), self.model.num_classes).to(self.device))
+                epoch_similarity = torch.cosine_similarity(mu, z).mean().item()
+
+            print("----- Epoch:{}, Loss:{:.4f}, Similarity:{:.4f}".format(
+                epoch, avg_epoch_loss, epoch_similarity))
+
+            # Every 5 epochs, generate 3D t-SNE plot
+            if epoch % 5 == 0:
+                self.generate_tsne_plot(all_latents_tensor, all_labels_tensor, epoch)
+
+            # Save model checkpoints if desired
+            # torch.save(self.model.state_dict(), f'cvae_epoch_{epoch}.pth')
+
+    def generate_tsne_plot(self, latents, labels, epoch):
+        # Perform t-SNE dimensionality reduction to 3D
+        tsne = TSNE(n_components=3, random_state=42)
+        latents_np = latents.numpy()
+        labels_np = labels.numpy()
+        tsne_results = tsne.fit_transform(latents_np)
+
+        fig = plt.figure(figsize=(8, 6))
+        ax = fig.add_subplot(111, projection='3d')
+        scatter = ax.scatter(tsne_results[:,0], tsne_results[:,1], tsne_results[:,2], 
+                             c=labels_np, cmap='tab10', s=5)
+        legend1 = ax.legend(*scatter.legend_elements(),
+                            title="Classes")
+        ax.add_artist(legend1)
+        ax.set_title(f'3D t-SNE of CVAE Latent Space at Epoch {epoch}')
+        plt.savefig(f'CVA_epoch_{epoch}.png')
+        plt.close()
+
+# Generator Class for CVAE
 class CVAE_Generator:
     """
-    Write code for loading trained Encoder-Decoder from saved checkpoints for Conditional Variational Autoencoder paradigm here.
-    use forward pass of both encoder-decoder to get output image conditioned to the class.
-    """
+    Generator for Conditional Variational AutoEncoder.
     
-    def save_image(digit, save_path):
-        pass
+    - Loads trained encoder and decoder from saved checkpoints.
+    - Generates images conditioned on class labels.
+    - Saves generated images to specified paths.
+    """
+    def __init__(self, model, checkpoint_path, device='cpu'):
+        self.device = device
+        self.model = model.to(self.device)
+        self.load_checkpoint(checkpoint_path)
+
+    def load_checkpoint(self, checkpoint_path):
+        if os.path.isfile(checkpoint_path):
+            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            self.model.eval()
+            print(f"Loaded model checkpoint from {checkpoint_path}")
+        else:
+            raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+
+    def generate_image(self, class_label, latent_vector=None):
+        """
+        Generates an image conditioned on the given class label.
+        
+        :param class_label: Integer representing the class label (0-9 for MNIST).
+        :param latent_vector: Optional tensor of shape (1, latent_dim). If None, sampled from standard normal.
+        :return: Generated image tensor.
+        """
+        with torch.no_grad():
+            if latent_vector is None:
+                z = torch.randn(1, self.model.latent_dim).to(self.device)
+            else:
+                z = latent_vector.to(self.device)
+            
+            # One-hot encode the class label
+            c = torch.zeros(1, self.model.num_classes).to(self.device)
+            c.scatter_(1, torch.tensor([[class_label]]).to(self.device), 1)
+            
+            generated = self.model.decode(z, c)
+            return generated.cpu()
+
+    @staticmethod
+    def save_image(image_tensor, save_path):
+        """
+        Saves the image tensor to the specified path.
+        
+        :param image_tensor: Tensor of shape (1, 784) or (1, 1, 28, 28).
+        :param save_path: File path to save the image.
+        """
+        if image_tensor.dim() == 2:
+            # (1, 784) -> (1, 1, 28, 28)
+            image_tensor = image_tensor.view(1, 1, 28, 28)
+        utils.save_image(image_tensor, save_path)
+        print(f"Image saved to {save_path}")
 
 def peak_signal_to_noise_ratio(img1, img2):
     if img1.shape[0] != 1: raise Exception("Image of shape [1,H,W] required.")
